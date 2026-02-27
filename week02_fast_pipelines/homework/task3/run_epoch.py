@@ -26,7 +26,7 @@ def get_vit_model() -> torch.nn.Module:
 
 
 def get_loaders() -> torch.utils.data.DataLoader:
-    dataset.download_extract_dataset()
+    # dataset.download_extract_dataset()
     train_transforms = dataset.get_train_transforms()
     val_transforms = dataset.get_val_transforms()
 
