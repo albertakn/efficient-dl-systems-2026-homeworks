@@ -3,6 +3,7 @@ name = "homework"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "notebook>=7.5.4",
     "numpy",
     "pytest",
     "torch",

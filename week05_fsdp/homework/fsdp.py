@@ -15,6 +15,8 @@ from torch.distributed.tensor import Shard, DTensor
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
+torch.use_deterministic_algorithms(True)
+
 logger = logging.getLogger(__name__)
 
 
@@ -81,6 +83,8 @@ class FSDPParam:
 
         assert param.size(shard_dim) % shard_world_size == 0
         # TODO(task1): shard the full `param` into `sharded_param`
+        chunk_size = param.size(shard_dim) // shard_world_size
+        sharded_param = param.narrow(shard_dim, shard_rank * chunk_size, chunk_size).clone()
         self.sharded_size = sharded_param.size()
         self.sharded_param = nn.Parameter(
             self.to_sharded_dtensor(sharded_param),
@@ -271,6 +275,22 @@ class FSDPModule:
             return  # no-op
         with record_function(self.with_fqn("FSDP::all_gather")):
             # TODO(task1): gather the parameters shards (cast to `param_dtype`) for each parameter
+            param_all_gather_outputs = []
+            for fsdp_param in self.fsdp_params:
+                sharded_tensor = fsdp_param.sharded_param._local_tensor
+                if fsdp_param.param_dtype is not None:
+                    sharded_tensor = sharded_tensor.to(fsdp_param.param_dtype)
+                all_gather_output = torch.empty(
+                    fsdp_param.orig_size,
+                    dtype=sharded_tensor.dtype,
+                    device=sharded_tensor.device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    all_gather_output,
+                    sharded_tensor,
+                    group=fsdp_param.mesh.get_group(),
+                )
+                param_all_gather_outputs.append(all_gather_output)
             self._all_gather_result = AllGatherResult(
                 param_all_gather_outputs=param_all_gather_outputs,
             )
@@ -285,6 +305,14 @@ class FSDPModule:
         #   - assign the unsharded parameter into the module (call `.to_unsharded()`)
         # then free the `all_gather_result`
         # NOTE: copy to the `.data` attribute
+        for fsdp_param, all_gather_output in zip(
+            self.fsdp_params,
+            self._all_gather_result.param_all_gather_outputs,
+        ):
+            fsdp_param.alloc_unsharded_param()
+            fsdp_param.unsharded_param.data.copy_(all_gather_output)
+            fsdp_param.to_unsharded()
+        self._all_gather_result = None
         self._sharded_state = ShardedState.UNSHARDED
         # TODO(task2): block all-gather stream until copy is complete,
         # so it doesn't interfere with the next unshard
@@ -294,6 +322,9 @@ class FSDPModule:
         # TODO(task1): for each parameter:
         #   - free the unsharded parameter
         #   - assign the sharded parameter into the module (call `.to_sharded()`)
+        for fsdp_param in self.fsdp_params:
+            fsdp_param.free_unsharded_param()
+            fsdp_param.to_sharded()
         self._sharded_state = ShardedState.SHARDED
 
     def record_post_forward(self) -> None:
@@ -385,6 +416,7 @@ def post_backward(module: FSDPModule):
     module._training_state = TrainingState.POST_BACKWARD
     with record_function(module.with_fqn("FSDP::post_backward_reshard")):
         # TODO(task1): reshard the module
+        module.reshard()
         # TODO(bonus2): reshard the module only if module.reshard_after_backward is True
     # TODO(bonus3): reduce the grads only if module.reduce_grads is True
     with record_function(module.with_fqn("FSDP::post_backward_reduce")):
@@ -396,6 +428,25 @@ def post_backward(module: FSDPModule):
         # TODO(task1):
         #   - cast the parameter gradients to reduce dtype
         #   - delete the unsharded parameter grad
+        for fsdp_param in module.fsdp_params:
+            grad = fsdp_param.unsharded_param.grad
+            if fsdp_param.reduce_dtype is not None:
+                grad = grad.to(fsdp_param.reduce_dtype)
+            fsdp_param.unsharded_param.grad = None
+            # TODO(task3): now block current stream until reduce-scatter stream finishes the copy
+            reduced_grad = torch.empty(
+                fsdp_param.sharded_size,
+                dtype=grad.dtype,
+                device=grad.device,
+            )
+            torch.distributed.reduce_scatter_tensor(
+                reduced_grad, grad,
+                op=torch.distributed.ReduceOp.AVG,
+                group=fsdp_param.mesh.get_group(),
+            )
+            fsdp_param.sharded_param.grad = fsdp_param.to_sharded_dtensor(
+                reduced_grad.to(fsdp_param.orig_dtype)
+            )
         # TODO(task3): now block current stream until reduce-scatter stream finishes the copy
         # TODO(task1): reduce-scatter the gradients and assign the reduced grad shards to `sharded_param.grad`s
         # (casting them to `orig_dtype`)

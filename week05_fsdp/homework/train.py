@@ -126,9 +126,9 @@ def build_dataloader(seq_len: int, batch_size: int = 1) -> StatefulDataLoader:
     return StatefulDataLoader(dataset, batch_size=batch_size)
 
 
-def trace_handler(prof: Any, traces_dir: pathlib.Path):
+def trace_handler(prof: Any, traces_dir: pathlib.Path, fsdp_prefix: str):
     prof.export_chrome_trace(
-        str(traces_dir / f"rank{torch.distributed.get_rank()}.json")
+        str(traces_dir / f"{fsdp_prefix}_rank{torch.distributed.get_rank()}.json")
     )
 
 
@@ -208,7 +208,9 @@ def train(
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
-            on_trace_ready=functools.partial(trace_handler, traces_dir=traces_dir),
+            on_trace_ready=functools.partial(
+                trace_handler, traces_dir=traces_dir, fsdp_prefix=fsdp
+            ),
         )
         profiler.start()
     losses: list[float] = []
@@ -256,7 +258,7 @@ def train(
         if num_steps_to_profile is not None and step == num_steps_to_profile:
             profiler.stop()
             with open(
-                snapshots_dir / f"rank{torch.distributed.get_rank()}.pickle",
+                snapshots_dir / f"{fsdp}_rank{torch.distributed.get_rank()}.pickle",
                 "wb",
             ) as output:
                 pickle.dump(torch.cuda.memory._snapshot(), output)
