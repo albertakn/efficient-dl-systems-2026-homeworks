@@ -275,30 +275,40 @@ class FSDPModule:
             return  # no-op
         with record_function(self.with_fqn("FSDP::all_gather")):
             # TODO(task1): gather the parameters shards (cast to `param_dtype`) for each parameter
-            param_all_gather_outputs = []
-            for fsdp_param in self.fsdp_params:
-                sharded_tensor = fsdp_param.sharded_param._local_tensor
-                if fsdp_param.param_dtype is not None:
-                    sharded_tensor = sharded_tensor.to(fsdp_param.param_dtype)
-                all_gather_output = torch.empty(
-                    fsdp_param.orig_size,
-                    dtype=sharded_tensor.dtype,
-                    device=sharded_tensor.device,
-                )
-                torch.distributed.all_gather_into_tensor(
-                    all_gather_output,
-                    sharded_tensor,
-                    group=fsdp_param.mesh.get_group(),
-                )
-                param_all_gather_outputs.append(all_gather_output)
-            self._all_gather_result = AllGatherResult(
-                param_all_gather_outputs=param_all_gather_outputs,
-            )
+            all_gather_stream = self.comm_ctx.all_gather_stream
+            if not self.comm_ctx.post_forward_order:
+                all_gather_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(all_gather_stream):
+                param_all_gather_outputs = []
+                for fsdp_param in self.fsdp_params:
+                    sharded_tensor = fsdp_param.sharded_param._local_tensor
+                    if fsdp_param.param_dtype is not None:
+                        sharded_tensor = sharded_tensor.to(fsdp_param.param_dtype)
+                    all_gather_output = torch.empty(
+                        fsdp_param.orig_size,
+                        dtype=sharded_tensor.dtype,
+                        device=sharded_tensor.device,
+                    )
+                    torch.distributed.all_gather_into_tensor(
+                        all_gather_output,
+                        sharded_tensor,
+                        group=fsdp_param.mesh.get_group(),
+                    )
+                    param_all_gather_outputs.append(all_gather_output)
             # TODO(task2): create an event which marks the end of all-gather
             # and save it in `AllGatherResult`
+            all_gather_event = all_gather_stream.record_event()
+            self._all_gather_result = AllGatherResult(
+                param_all_gather_outputs=param_all_gather_outputs,
+                all_gather_event=all_gather_event,
+            )
 
     def wait_for_unshard(self):
         # TODO(task2): wait for the end of the all-gather launched by `unshard`
+        if self._all_gather_result.all_gather_event is not None:
+            torch.cuda.current_stream().wait_event(
+                self._all_gather_result.all_gather_event
+            )
         # TODO(task1): for each parameter:
         #   - allocate its unsharded paramter
         #   - copy the all-gather output into it
@@ -316,6 +326,7 @@ class FSDPModule:
         self._sharded_state = ShardedState.UNSHARDED
         # TODO(task2): block all-gather stream until copy is complete,
         # so it doesn't interfere with the next unshard
+        self.comm_ctx.all_gather_stream.wait_stream(torch.cuda.current_stream())
 
     def reshard(self):
         # TODO(bonus1): do nothing if called during forward adn self._reshard_after_forward is True
@@ -350,6 +361,16 @@ class FSDPModule:
     def _backward_prefetch(self) -> None:
         # TODO(task3): using `self._post_forward_indices` and `self.comm_ctx.post_forward_order`
         # find the right FSDPModule to prefetch
+        if not self._post_forward_indices:
+            return
+        # Backward processes modules in reverse forward order,
+        # so .pop() gives the most recent forward index for this module
+        current_index = self._post_forward_indices.pop()
+        # The next module in backward order is the previous one in forward order
+        target_index = current_index - 1
+        if target_index < 0:
+            return  # first forward module -- nothing to prefetch
+        target_fsdp_module = self.comm_ctx.post_forward_order[target_index]
         self._prefetch_unshard(target_fsdp_module)
 
     @staticmethod
@@ -406,8 +427,8 @@ def pre_backward(module: FSDPModule, grad: torch.Tensor):
         module._training_state = TrainingState.PRE_BACKWARD
         module.unshard()  # no-op if prefetched
         module.wait_for_unshard()
-        # module._backward_prefetch()
-        # TODO(task3): uncomment the next line
+        module._backward_prefetch()
+        # TODO(task3): uncomment the next line (done)
     return grad
 
 
@@ -425,34 +446,59 @@ def post_backward(module: FSDPModule):
         #   - you should wait for the current stream to finish its backward pass
         #   - you should copy the grads into some memory allocated in the reduce-scatter stream
         #     so it doesn't interfere with the next backward
+        reduce_scatter_stream = module.comm_ctx.reduce_scatter_stream
+        # RS stream waits for current stream to finish backward compute
+        reduce_scatter_stream.wait_stream(torch.cuda.current_stream())
+
         # TODO(task1):
         #   - cast the parameter gradients to reduce dtype
         #   - delete the unsharded parameter grad
-        for fsdp_param in module.fsdp_params:
-            grad = fsdp_param.unsharded_param.grad
-            if fsdp_param.reduce_dtype is not None:
-                grad = grad.to(fsdp_param.reduce_dtype)
-            fsdp_param.unsharded_param.grad = None
-            # TODO(task3): now block current stream until reduce-scatter stream finishes the copy
-            reduced_grad = torch.empty(
-                fsdp_param.sharded_size,
-                dtype=grad.dtype,
-                device=grad.device,
-            )
-            torch.distributed.reduce_scatter_tensor(
-                reduced_grad, grad,
-                op=torch.distributed.ReduceOp.AVG,
-                group=fsdp_param.mesh.get_group(),
-            )
-            fsdp_param.sharded_param.grad = fsdp_param.to_sharded_dtensor(
-                reduced_grad.to(fsdp_param.orig_dtype)
-            )
+        # Copy grads into buffers allocated in the RS stream
+        grad_inputs = []
+        with torch.cuda.stream(reduce_scatter_stream):
+            for fsdp_param in module.fsdp_params:
+                grad = fsdp_param.unsharded_param.grad
+                if fsdp_param.reduce_dtype is not None:
+                    # .to() with different dtype already creates a new tensor (acts as copy)
+                    grad = grad.to(fsdp_param.reduce_dtype)
+                else:
+                    # Same dtype -- need explicit clone so original grad memory can be freed
+                    grad = grad.clone()
+                grad_inputs.append(grad)
+
         # TODO(task3): now block current stream until reduce-scatter stream finishes the copy
+        # Record event after copies are done
+        copy_event = reduce_scatter_stream.record_event()
+        # Block current stream until copies are done, so we can safely free original grads
+        torch.cuda.current_stream().wait_event(copy_event)
+
+        # Free original unsharded grads (memory can now be reused by next backward)
+        for fsdp_param in module.fsdp_params:
+            fsdp_param.unsharded_param.grad = None
+
         # TODO(task1): reduce-scatter the gradients and assign the reduced grad shards to `sharded_param.grad`s
         # (casting them to `orig_dtype`)
+        # Perform reduce-scatter in RS stream (overlaps with next backward on default stream)
+        with torch.cuda.stream(reduce_scatter_stream):
+            for fsdp_param, grad_input in zip(module.fsdp_params, grad_inputs):
+                reduced_grad = torch.empty(
+                    fsdp_param.sharded_size,
+                    dtype=grad_input.dtype,
+                    device=grad_input.device,
+                )
+                torch.distributed.reduce_scatter_tensor(
+                    reduced_grad, grad_input,
+                    op=torch.distributed.ReduceOp.AVG,
+                    group=fsdp_param.mesh.get_group(),
+                )
+                fsdp_param.sharded_param.grad = fsdp_param.to_sharded_dtensor(
+                    reduced_grad.to(fsdp_param.orig_dtype)
+                )
+
         # TODO(task3): create an event which marks the end of the reduce-scatter
         # and save it to `_post_reduce_event` to wait for it
         # when the whole backward finishes (in the final callback)
+        module._post_reduce_event = reduce_scatter_stream.record_event()
 
 
 def register_pre_backward_hook(hook: Callable, output: Any) -> Any:
