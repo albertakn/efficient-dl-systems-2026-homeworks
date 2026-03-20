@@ -81,9 +81,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = config.hidden_dim // config.num_heads
 
         # TODO: Replace with fused QKV projection
-        self.q_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
+        self.qkv_proj = nn.Linear(config.hidden_dim, 3*config.hidden_dim, bias=False)
         self.out_proj = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
 
         self.rope = RotaryPositionalEmbedding(
@@ -101,9 +99,8 @@ class MultiHeadAttention(nn.Module):
     ) -> torch.Tensor:
         B, S, H = x.shape
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.chunk(3, dim=-1)
 
         q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
