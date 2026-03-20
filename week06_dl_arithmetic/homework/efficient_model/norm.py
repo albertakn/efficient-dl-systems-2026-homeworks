@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 
+@torch.compile
 def rmsnorm_forward(x, weight, eps):
     """Zero-Centered RMSNorm forward."""
     # TODO: Replace with fused implementation
@@ -19,13 +20,25 @@ def rmsnorm_forward(x, weight, eps):
     scale = 1.0 + weight.float()
     output = normalized * scale
     # TODO: Think about additional return parameters
-    return output.to(input_dtype)
+    return output.to(input_dtype), rsqrt.to(input_dtype)
 
 
-def rmsnorm_backward(grad_output,):
+@torch.compile
+def rmsnorm_backward(grad_output, x, rsqrt, weight):
     """Zero-Centered RMSNorm backward."""
     # TODO: Implement backward pass
-    raise NotImplementedError("TODO: Implement backward pass")
+    
+    grad_eps = None
+
+    normalized = x.float() * rsqrt  
+    grad_weight = (grad_output.float() * normalized).sum(dim=(0, 1))
+
+    scale = 1.0 + weight.float()     
+    g = grad_output.float() * scale 
+    c = (x.float() * g).mean(dim=-1, keepdim=True)
+    grad_x = rsqrt * (g - x.float() * rsqrt * rsqrt * c)
+    return grad_x, grad_weight, grad_eps
+
 
 
 class RMSNormFunction(torch.autograd.Function):
@@ -36,10 +49,10 @@ class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps):
         # TODO: Replace with fused implementation
-        output = rmsnorm_forward(x, weight, eps)
+        output, rsqrt = rmsnorm_forward(x, weight, eps)
 
         # TODO: Save tensors for backward (make it memory-efficient)
-        ctx.save_for_backward()  # TODO: Fill this
+        ctx.save_for_backward(x, rsqrt, weight)  # TODO: Fill this
 
         return output
 
@@ -47,7 +60,11 @@ class RMSNormFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         # TODO: Implement fused backward pass
         # TODO: Make it work with memory-efficient forward
-        raise NotImplementedError("TODO: Implement backward pass")
+
+        x, rsqrt, weight = ctx.saved_tensors
+        grad_x, grad_weight, grad_eps = rmsnorm_backward(grad_output, x, rsqrt, weight )
+        
+        return grad_x, grad_weight, grad_eps
 
 
 class RMSNorm(nn.Module):
