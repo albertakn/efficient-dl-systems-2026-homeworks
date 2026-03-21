@@ -6,11 +6,24 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
  
 # HINT: you may want to change these functions
-def linear_warmup_scheduler(...):
-    # TODO
+def linear_warmup_scheduler(step, alpha_end, alpha_start=0, warmup=1):
+    if step < warmup:
+        a = step / float(warmup)
+        return (1.0-a) * alpha_start + a * alpha_end
+    return alpha_end
 
-def linear_hl_warmup_scheduler(...):
-    # TODO
+
+def linear_hl_warmup_scheduler(step, beta_end, beta_start=0, warmup=1):
+    def f(beta, eps=1e-8):
+        return math.log(0.5)/math.log(beta+eps)-1
+
+    def f_inv(t):
+        return math.pow(0.5, 1/(t+1))
+
+    if step < warmup:
+        a = step / float(warmup)
+        return f_inv((1.0-a) * f(beta_start) + a * f(beta_end))
+    return beta_end
  
  
 @torch.compile(fullgraph=True) # you can comment out this line for subtask 1
@@ -20,14 +33,42 @@ def ademamix_foreach_fn(
     exp_avgs: list[Tensor],
     exp_avgs_slow: list[Tensor],
     exp_avg_sqs: list[Tensor],
-    *,
-    ...
+    beta1: float,
+    beta2: float,
+    beta3: Tensor,
+    alpha: Tensor,
+    bias_correction1: Tensor,
+    bias_correction2: Tensor,
+    lr: float,
+    weight_decay: float,
+    eps: float,
 ):
     # TODO: Replace per-tensor ops with torch._foreach_* equivalents:
     # torch._foreach_lerp_(exp_avgs, grads, 1 - beta1)
     # torch._foreach_mul_(exp_avg_sqs, beta2)
     # torch._foreach_addcmul_(exp_avg_sqs, grads, grads, 1 - beta2)
     # etc.
+    torch._foreach_lerp_(exp_avgs, grads, 1 - beta1)
+    
+    torch._foreach_lerp_(exp_avgs_slow, grads, 1 - beta3)
+
+    torch._foreach_mul_(exp_avg_sqs, beta2)
+    torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+
+    denom = torch._foreach_sqrt(exp_avg_sqs)
+    torch._foreach_div_(denom, bias_correction2.sqrt())
+    torch._foreach_add_(denom, eps)
+
+    update = torch._foreach_div(exp_avgs, bias_correction1)
+    scaled_slow = torch._foreach_mul(exp_avgs_slow, alpha)
+    torch._foreach_add_(update, scaled_slow)
+    torch._foreach_div_(update, denom)
+
+    if weight_decay != 0:
+        torch._foreach_add_(update, params, alpha=weight_decay)
+
+    torch._foreach_add_(params, update, alpha=-lr)
+
  
 class AdEMAMix(Optimizer):
     r"""Implements the AdEMAMix algorithm.
@@ -94,16 +135,68 @@ class AdEMAMix(Optimizer):
             exp_avgs_slow: list[Tensor] = []
             exp_avg_sqs: list[Tensor] = []
 
-            # TODO: prepare lists of tensors for 'foreach' step
-            # as well as all other necessary inputs
-            # HINT: (think about input types)
-            
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                if p.grad.is_sparse:
+                    raise RuntimeError('AdEMAMix does not support sparse gradients.')
+
+                state = self.state[p]
+
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    # Exponential moving average of gradient values
+                    if beta1 != 0.0: # save memory in case beta1 is 0.0
+                        state['exp_avg_fast'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    else: 
+                        state['exp_avg_fast'] = None
+                    state['exp_avg_slow'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                state['step'] += 1
+
+                params.append(p)
+                grads.append(p.grad)
+                exp_avgs.append(state['exp_avg_fast'])
+                exp_avgs_slow.append(state['exp_avg_slow'])
+                exp_avg_sqs.append(state['exp_avg_sq'])
+
+            if len(params) == 0:
+                continue
+
+            step = self.state[params[0]]['step']
+            device = params[0].device
+
+            bias_correction1 = 1 - beta1 ** step
+            bias_correction2 = 1 - beta2 ** step
+
+            if alpha_warmup is not None:
+                alpha = linear_warmup_scheduler(step, alpha_end=alpha_final, alpha_start=0, warmup=alpha_warmup)
+            else:
+                alpha = alpha_final
+
+            if beta3_warmup is not None:
+                beta3 = linear_hl_warmup_scheduler(step, beta_end=beta3_final, beta_start=beta1, warmup=beta3_warmup)
+            else:
+                beta3 = beta3_final
+
             ademamix_foreach_fn(
                 params=params,
                 grads=grads,
                 exp_avgs=exp_avgs,
                 exp_avgs_slow=exp_avgs_slow,
                 exp_avg_sqs=exp_avg_sqs,
-                ...
+                beta1=beta1,
+                beta2=beta2,
+                beta3=torch.tensor(beta3, device=device),
+                alpha=torch.tensor(alpha, device=device),
+                bias_correction1=torch.tensor(bias_correction1, device=device),
+                bias_correction2=torch.tensor(bias_correction2, device=device),
+                lr=lr,
+                weight_decay=lmbda,
+                eps=eps,
             )
+
         return loss
