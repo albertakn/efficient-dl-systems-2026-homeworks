@@ -168,15 +168,18 @@ class MemoryEfficientSwiGLUMLP(torch.autograd.Function):
         swiglu_activation_out = swiglu_activation_out.reshape(-1, swiglu_activation_out.shape[-1])
 
         grad_w_down = grad_output.T @ swiglu_activation_out
-        
+
+        del grad_activation_down
+        del swiglu_activation_out
         
         grad_w_gate = grad_activation_gate_out.T @ x
-        grad_activation_gate_in = grad_activation_gate_out @ w_gate
+        # grad_activation_gate_in = grad_activation_gate_out @ w_gate
 
         grad_w_up = grad_activation_up_out.T @ x
-        grad_activation_up_in = grad_activation_up_out @ w_up
+        # grad_activation_up_in = grad_activation_up_out @ w_up
         
-        grad_x = grad_activation_gate_in + grad_activation_up_in 
+        grad_x = grad_activation_gate_out @ w_gate
+        grad_x = grad_x + grad_activation_up_out @ w_up 
 
         grad_alpha = None
         grad_limit = None
